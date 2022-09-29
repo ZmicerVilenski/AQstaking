@@ -1,162 +1,317 @@
-// !!! Contract in development, do not use in production !!!
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Token.sol";
-import "./IERC900.sol";
+import "./ABDKMath64x64.sol";
 
 /**
- * @title ERC900 Simple Staking Interface basic implementation
- * @dev See https://github.com/ethereum/EIPs/blob/master/EIPS/eip-900.md
+ * @title Aqualis staking contract
  */
-contract AqualisStaking is ReentrancyGuard, IERC900 {
-    uint256 public constant REWARDS_PER_WEEK = 2;
-    uint256 public constant PENALTY_PER_WEEK = 3; // 0.3% It will be necessary to divide percent powered by 10
-    uint256 public constant COUMPOUND_FREQ = 1 weeks;
-    uint256 public constant MINIMUM_WEEK_NUM = 5;
-    uint256 public constant MINIMUM_STAKE = 5 weeks;
-    uint256 public constant MAXIMUM_WEEK_NUM = 104;
-    uint256 public constant MAXIMUM_STAKE = 104 weeks;
-
+contract AqualisStaking is Ownable, ReentrancyGuard {
+    uint256 public rewardsPerWeek; // 20 - 2% by default
+    uint256 public penaltyPerWeek; // 3 by default that means 0.3% It will be necessary to divide percent powered by 10
+    uint256 public minimumWeeksNum; // 5 by default
+    uint256 public maximumWeeksNum; // 104 by default
     address public treasuryAddress;
     address public rewardsPoolAddress;
 
     // Struct for personal stakes
     // amount - the amount of tokens in the stake
-    // aqualisPower - AP
-    // timeOfLastUpdate - when the stake was made/changed_ (in seconds since Unix epoch)
     // timeLock - when the stake finish (in seconds since Unix epoch)
+    // autoExtended - flag of automaticaly extended staking period for maximum avalible (maximumWeeksNum)
     struct StakeInfo {
         uint256 amount;
-        uint256 aqualisPower;
-        uint256 timeOfLastUpdate; // @TODO optimize
-        uint256 timeLock; // optimize
+        uint256 timeLock;
+        bool autoExtended;
     }
     mapping(address => StakeInfo) private stakers;
     Token private immutable aqualisToken;
 
-    event StakingExtended(address indexed user, uint256 newTimeLock);
+    event Staked(
+        address indexed staker,
+        uint256 amount,
+        uint256 total,
+        uint256 timeLock
+    );
+    event Unstaked(
+        address indexed staker,
+        uint256 amount,
+        uint256 total,
+        uint256 weeksNum
+    );
+    event StakingChended(
+        address indexed staker,
+        uint256 newAmount,
+        uint256 newTimeLock,
+        bool autoExtended
+    );
 
     /**
      * @dev Constructor function
      * @param _aqualisToken ERC20 The address of the token contract used for staking
      */
-    constructor(
-        address _aqualisToken,
-        address _rewardsPoolAddress,
-        address _treasuryAddress
-    ) {
+    constructor(address _aqualisToken) {
         aqualisToken = Token(_aqualisToken);
-        rewardsPoolAddress = _rewardsPoolAddress;
+        // set default values:
+        rewardsPerWeek = 20;
+        penaltyPerWeek = 3;
+        minimumWeeksNum = 5;
+        maximumWeeksNum = 104;
+    }
+
+    /**
+     * @dev Set Treasury address.
+     * @param _treasuryAddress Treasury address
+     */
+    function setTreasuryAddress(address _treasuryAddress) external onlyOwner {
         treasuryAddress = _treasuryAddress;
     }
 
     /**
-     * @dev Helper function to create stakes for a given address
-     * @param _staker address The address the stake is being created for
-     * @param _amount uint256 The number of tokens being staked
-     * @param _data bytes optional data to include in the Stake event. Number of staking weeks
+     * @dev Set Rewards pool address.
+     * @param _rewardsPoolAddress Rewards pool address
      */
-    function createStake(
-        address _staker,
-        uint256 _amount,
-        bytes memory _data
-    ) internal {
-        require(_amount > 0, "Amount smaller than minimimum deposit");
-        if (stakers[_staker].amount != 0) {
-            uint256 weeksNum = dataToWeeksNum(_data);
-            require(
-                weeksNum >= MINIMUM_WEEK_NUM,
-                "MInsufficient staking interval"
-            );
-            require(weeksNum <= MAXIMUM_WEEK_NUM, "Maximum interval exceeded");
-            // @TODO optimize. create structure in memory and write to storage in one run
-            stakers[_staker].amount = _amount;
-            stakers[_staker].timeOfLastUpdate = block.timestamp;
-            stakers[_staker].timeLock = block.timestamp + (weeksNum * 1 weeks);
-        } else {
-            // If there has already been staking and the user adds another amount of tokens,
-            // then his AP will be calculated on the current date from the old amount, and the new amount (old + added) will be calculated from the current date.
-            // The timelock cannot be changed. There is a separate function to increase it - extendStaking()
-            stakers[_staker].aqualisPower += _calculateRewards(_staker);
-            stakers[_staker].amount += _amount; //Important, the amount should change after the reward calculations
-            stakers[_staker].timeOfLastUpdate = block.timestamp; //Important, the timeOfLastUpdate should change after the reward calculations
-        }
-
-        aqualisToken.transferFrom(_staker, address(this), _amount);
-        emit Staked(_staker, _amount, totalStakedFor(_staker), _data);
+    function setRewardsPoolAddress(address _rewardsPoolAddress)
+        external
+        onlyOwner
+    {
+        rewardsPoolAddress = _rewardsPoolAddress;
     }
 
     /**
-     * @notice Stakes a certain amount of tokens, this MUST transfer the given amount from the user
+     * @dev Set Rewards per compound period
+     * @param _rewardsPerWeek Rewards per compound period,
+     * by default = 20 or 2% (multiplied by 10 to allow to enter a fractional number)
+     * in Smart contract used only integer numbers, no float
+     */
+    function setRewardsPerCompPeriod(uint256 _rewardsPerWeek)
+        external
+        onlyOwner
+    {
+        rewardsPerWeek = _rewardsPerWeek;
+    }
+
+    /**
+     * @dev Set Rewards per compound period
+     * @param _penaltyPerWeek Penalty per compound period if stake withdraw befor time lock (staking period),
+     * by default = 3 or 0.3% (multiplied by 10 to allow to enter a fractional number)
+     * in Smart contract used only integer numbers, no float
+     */
+    function setPenaltyPerCompPeriod(uint256 _penaltyPerWeek)
+        external
+        onlyOwner
+    {
+        penaltyPerWeek = _penaltyPerWeek;
+    }
+
+    /**
+     * @dev Set minimum number of weeks for staking.
+     * @param _minimumWeeksNum Number of weeks
+     */
+    function setMinimumWeeksNum(uint256 _minimumWeeksNum) external onlyOwner {
+        minimumWeeksNum = _minimumWeeksNum;
+    }
+
+    /**
+     * @dev Set maximum number of weeks for staking.
+     * @param _maximumWeeksNum Number of weeks
+     */
+    function setMaximumWeeksNum(uint256 _maximumWeeksNum) external onlyOwner {
+        maximumWeeksNum = _maximumWeeksNum;
+    }
+
+    /**
+     * @notice Return deposit info (value array [stakeAmount, aqualisPower])
+     * @param _staker Staker address
+     */
+    function getDepositInfo(address _staker)
+        external
+        view
+        returns (uint256 stakeAmount, uint256 aqualisPower)
+    {
+        stakeAmount = stakers[_staker].amount;
+        aqualisPower = _calculateRewards(_staker);
+    }
+
+    /**
+     * @notice Return Stake info in structure {amount, timeLock}
+     * @param _staker Staker address
+     */
+    function getStakeInfo(address _staker)
+        external
+        view
+        returns (StakeInfo memory)
+    {
+        return stakers[_staker];
+    }
+
+    /**
+     * @notice Stakes a certain amount of tokens, this MUST transfer the given amount from the staker
      * @notice MUST trigger Staked event
      * @param _amount uint256 the amount of tokens to stake
-     * @param _data bytes optional data to include in the Stake event. Number of staking weeks
+     * @param _weeksNum number of staking weeks
      */
-    function stake(uint256 _amount, bytes calldata _data) external {
-        createStake(msg.sender, _amount, _data);
+    function stake(uint256 _amount, uint256 _weeksNum) external {
+        _createStake(msg.sender, _amount, _weeksNum);
     }
 
     /**
      * @notice Stakes a certain amount of tokens, this MUST transfer the given amount from the caller
      * @notice MUST trigger Staked event
-     * @param _user address the address the tokens are staked for
+     * @param _staker address of the  staker
      * @param _amount uint256 the amount of tokens to stake
-     * @param _data bytes optional data to include in the Stake event. Number of staking weeks
+     * @param _weeksNum number of staking weeks
      */
-    // @TODO wouldn't this feature be a problem, because someone can stake for another?
     function stakeFor(
-        address _user,
+        address _staker,
         uint256 _amount,
-        bytes calldata _data
-    ) external {
-        createStake(_user, _amount, _data);
+        uint256 _weeksNum
+    ) external onlyOwner {
+        _createStake(_staker, _amount, _weeksNum);
     }
 
     /**
-     * @notice Extend the staking period. The user may also add additional weeks onto their current stake to increase rewards, by minimum intervals of 1 week.
+     * @dev function to create stakes for a given address
+     * @param _staker address of the  staker
+     * @param _amount number of tokens being staked
+     * @param _weeksNum number of staking weeks
+     */
+    function _createStake(
+        address _staker,
+        uint256 _amount,
+        uint256 _weeksNum
+    ) internal {
+        require(_amount > 0, "Amount smaller than minimimum deposit");
+        require(_weeksNum >= minimumWeeksNum, "Insufficient staking interval");
+        // if user stake at least one week more than the maximum, then the stake will go into a state of automatic renewal
+        // the number of weeks before the unstake will always be equal to the maximum
+        if (_weeksNum > maximumWeeksNum) {
+            stakers[_staker].autoExtended = true;
+        }
+        stakers[_staker].amount += _amount;
+        stakers[_staker].timeLock = block.timestamp + (_weeksNum * 1 weeks);
+
+        aqualisToken.transferFrom(_staker, address(this), _amount);
+        emit Staked(
+            _staker,
+            _amount,
+            totalStakedFor(_staker),
+            stakers[_staker].timeLock
+        );
+    }
+
+    /**
+     * @notice activate auto renewal of staking
+     */
+    function activateAutoExtending() external {
+        stakers[msg.sender].autoExtended = true;
+        emit StakingChended(
+            msg.sender,
+            stakers[msg.sender].amount,
+            stakers[msg.sender].timeLock,
+            stakers[msg.sender].autoExtended
+        );
+    }
+
+    /**
+     * @notice return flag of auto extenging for staker's stake
+     * @param _staker address of the  staker
+     */
+    function isStakeAutoExtending(address _staker)
+        external
+        view
+        returns (bool)
+    {
+        return stakers[_staker].autoExtended;
+    }
+
+    /**
+     * @notice disable auto renewal of staking
+     */
+    function disableAutoExtending() external {
+        stakers[msg.sender].autoExtended = false;
+        stakers[msg.sender].timeLock =
+            block.timestamp +
+            (maximumWeeksNum * 1 weeks);
+        emit StakingChended(
+            msg.sender,
+            stakers[msg.sender].amount,
+            stakers[msg.sender].timeLock,
+            stakers[msg.sender].autoExtended
+        );
+    }
+
+    /**
+     * @notice Extend the staking period. The staker may also add additional weeks onto their current stake to increase rewards, by minimum intervals of 1 week.
      * @param _weeksNum number of weeks to extend
      */
     function extendStaking(uint256 _weeksNum) external {
-        require(_weeksNum > 0, "Minimum extended period 1 week");
-        require(_weeksNum < MAXIMUM_WEEK_NUM, "Maximum interval exceeded");
-        // @TODO A complex check can be made to ensure that the added number of weeks does not exceed the maximum (104),
-        // otherwise the AP will not be added, and the staking lock will remain.
-        // But it will consume more gas
+        require(_weeksNum > 0, "Number of weeks must be > 0");
+        // if user stake at least one week more than the maximum, then the stake will go into a state of automatic renewal
+        // the number of weeks before the unstake will always be equal to the maximum
+        uint256 weeksLeft;
+        if (block.timestamp < stakers[msg.sender].timeLock) {
+            weeksLeft =
+                (stakers[msg.sender].timeLock - block.timestamp) /
+                1 weeks;
+        }
+        if (weeksLeft + _weeksNum > maximumWeeksNum) {
+            stakers[msg.sender].autoExtended = true;
+        }
         stakers[msg.sender].timeLock += _weeksNum * 1 weeks;
-        emit StakingExtended(msg.sender, stakers[msg.sender].timeLock);
+        emit StakingChended(
+            msg.sender,
+            stakers[msg.sender].amount,
+            stakers[msg.sender].timeLock,
+            stakers[msg.sender].autoExtended
+        );
     }
 
     /**
-     * @notice Unstakes a certain amount of tokens, this SHOULD return the given amount of tokens to the user, if unstaking is currently not possible the function MUST revert
+     * @notice Increase staking amount.
+     * @param _amount amount by which to increase staking
+     */
+    function increaseStakingAmount(uint256 _amount) external {
+        require(_amount > 0, "Amount must be > 0");
+        stakers[msg.sender].amount += _amount;
+        emit StakingChended(
+            msg.sender,
+            stakers[msg.sender].amount,
+            stakers[msg.sender].timeLock,
+            stakers[msg.sender].autoExtended
+        );
+    }
+
+    /**
+     * @notice Unstakes a certain amount of tokens, this SHOULD return the given amount of tokens to the staker, if unstaking is currently not possible the function MUST revert
      * @notice MUST trigger Unstaked event
      * @param _amount uint256 the amount of tokens to unstake
-     * @param _data bytes optional data to include in the Unstake event
      */
-    function unstake(uint256 _amount, bytes calldata _data)
-        external
-        nonReentrant
-    {
+    function unstake(uint256 _amount) external nonReentrant {
         address staker = msg.sender;
         require(
             stakers[staker].amount >= _amount,
             "Can't withdraw more than you have"
         );
         require(
-            stakers[staker].timeLock > block.timestamp,
+            stakers[staker].timeLock <= block.timestamp,
             "Staking period has not expired"
         );
-        stakers[staker].aqualisPower = _calculateRewards(staker);
-        stakers[staker].amount -= _amount; //Important, the amount should change after the reward calculations
-        stakers[staker].timeOfLastUpdate = block.timestamp; //Important, the timeOfLastUpdate should change after the reward calculations
+        stakers[staker].amount -= _amount;
 
         aqualisToken.transfer(staker, _amount);
-        emit Unstaked(staker, _amount, totalStakedFor(staker), _data);
+        emit Unstaked(
+            staker,
+            _amount,
+            totalStakedFor(staker),
+            stakers[msg.sender].timeLock
+        );
     }
 
     /**
-     * @notice UnstakesAll amount of tokens, this SHOULD return the given amount of tokens to the user, if unstaking is currently not possible the function MUST revert
+     * @notice UnstakesAll amount of tokens, this SHOULD return the given amount of tokens to the staker, if unstaking is currently not possible the function MUST revert
      * @notice MUST trigger Unstaked event
      * @dev Unstaking tokens is an atomic operation—either all of the tokens in a stake, or none of the tokens.
      */
@@ -165,42 +320,43 @@ contract AqualisStaking is ReentrancyGuard, IERC900 {
         uint256 amount = stakers[staker].amount;
         require(amount > 0, "You have no deposit");
         require(
-            stakers[staker].timeLock > block.timestamp,
+            stakers[staker].timeLock <= block.timestamp,
             "Staking period has not expired"
         );
         stakers[staker].amount = 0;
-        stakers[staker].timeOfLastUpdate = 0;
         stakers[staker].timeLock = 0;
-        // stakers[staker].aqualisPower = 0; // I don't think it needs to be reset.
+
         aqualisToken.transfer(staker, amount);
-        emit Unstaked(staker, amount, totalStakedFor(staker), "");
+        emit Unstaked(staker, amount, totalStakedFor(staker), 0);
     }
 
-    // @TODO prohibit unstaking before the period
-    // Early Unstaking Fee
-    // Staked AQL may be unstaked earlier for a fee of 1% plus 0.3% per week remaining (rounded up), for example:
-    // Less than 1 week remaining 1% + 0.3%  = 1.3%
-    // Between 10 to 11 weeks remaining = 1% + 3.3% = 4.3%
-    // Between 104 to 105 weeks remaining = 1% + 31.5% = 32.5%
-    // This fee will be distributed in the following way:
-    // 50% will be burned
-    // 40% will be distributed to the AP Rewards Pool
-    // 10% will be distributed to the Treasury
+    /**
+     * @notice Unstakes a certain amount of tokens, before staking period finished, while taking a fine
+     * @notice Early Unstaking Fee
+     * Staked AQL may be unstaked earlier for a fee of 1% plus 0.3% per week remaining (rounded up), for example:
+     * Less than 1 week remaining 1% + 0.3%  = 1.3%
+     * Between 10 to 11 weeks remaining = 1% + 3.3% = 4.3%
+     * Between 104 to 105 weeks remaining = 1% + 31.5% = 32.5%
+     * @notice MUST trigger Unstaked event
+     * @param _amount uint256 the amount of tokens to unstake
+     */
     function unstakeWithPenalty(uint256 _amount) external nonReentrant {
         address staker = msg.sender;
-        uint256 weeksNum = unstakeTimer(staker) / 1 weeks;
-        uint256 penaltyPercent = weeksNum * PENALTY_PER_WEEK + 10; // +10 (1%) because PENALTY_PER_WEEK multiply by 10
+        uint256 weeksNum = weeksForUnstake(staker);
+        uint256 penaltyPercent = weeksNum * penaltyPerWeek + 10; // +10 (1%) because penaltyPerWeek multiply by 10
         uint256 penalty = (_amount * penaltyPercent) / 1000;
         uint256 returnAmount = _amount - penalty;
 
-        stakers[staker].aqualisPower = _calculateRewards(staker); // Leave the full calculation of the AP or need to take the fine?
         stakers[staker].amount -= _amount;
-        stakers[staker].timeOfLastUpdate = block.timestamp;
 
         aqualisToken.transfer(staker, returnAmount);
         // 50% will be burned
         uint256 toBurn = penalty / 2;
-        aqualisToken.burn(staker, toBurn);
+        //aqualisToken.burn(address(this), toBurn);
+        aqualisToken.transfer(
+            address(0x000000000000000000000000000000000000dEaD),
+            toBurn
+        ); // To burn contract send tokens to DEAD address
         // 10% will be distributed to the Treasury
         uint256 toTreasury = penalty / 10;
         aqualisToken.transfer(treasuryAddress, toTreasury);
@@ -210,7 +366,12 @@ contract AqualisStaking is ReentrancyGuard, IERC900 {
             penalty - toBurn - toTreasury
         );
 
-        emit Unstaked(staker, returnAmount, totalStakedFor(staker), "");
+        emit Unstaked(
+            staker,
+            returnAmount,
+            totalStakedFor(staker),
+            stakers[staker].timeLock
+        );
     }
 
     /**
@@ -226,7 +387,7 @@ contract AqualisStaking is ReentrancyGuard, IERC900 {
      * @notice Returns the current total of tokens staked
      * @return uint256 The number of tokens staked in the contract
      */
-    function totalStaked() public view returns (uint256) {
+    function totalStaked() external view returns (uint256) {
         return aqualisToken.balanceOf(address(this));
     }
 
@@ -234,172 +395,121 @@ contract AqualisStaking is ReentrancyGuard, IERC900 {
      * @notice Address of the token being used by the staking interface
      * @return address The address of the ERC20 token used for staking
      */
-    function token() public view returns (address) {
+    function token() external view returns (address) {
         return address(aqualisToken);
     }
 
     /**
-     * @notice MUST return true if the optional history functions are implemented, otherwise false
-     * @dev Since we don't implement the optional interface, this always returns false
-     * @return bool Whether or not the optional history functions are implemented
+     * @notice returns reward in AP
+     * @param _staker staker address
+     * @return rewards in Aqualis Power
      */
-    function supportsHistory() public pure returns (bool) {
-        return false;
-    }
-
     function calculateAqualisPower(address _staker)
         external
         view
         returns (uint256)
     {
-        return stakers[_staker].aqualisPower + _calculateRewards(_staker);
+        return _calculateRewards(_staker);
     }
 
-    // For Snapshot
+    /**
+     * @notice Function for Snapshot
+     * @param _staker staker address
+     * @return rewards in Aqualis Power
+     */
     function calculateReward(address _staker) external view returns (uint256) {
-        return stakers[_staker].aqualisPower + _calculateRewards(_staker);
+        return _calculateRewards(_staker);
     }
 
-    function getDepositInfo(address _staker)
-        public
-        view
-        returns (uint256 _stake, uint256 _rewards)
-    {
-        _stake = stakers[_staker].amount;
-        _rewards = stakers[_staker].aqualisPower + _calculateRewards(_staker);
-    }
-
-    function getStakeInfo(address _staker)
-        public
-        view
-        returns (StakeInfo memory)
-    {
-        return stakers[_staker];
-    }
-
-    // Utility function that returns the timer for unstake
+    /**
+     * @notice Returns the timer for unstake in seconds
+     * @param _staker staker address
+     * @return _timer remaining seconds to unstake
+     */
     function unstakeTimer(address _staker)
         public
         view
         returns (uint256 _timer)
     {
+        if (stakers[_staker].autoExtended) {
+            return maximumWeeksNum * 1 weeks;
+        }
+
         if (stakers[_staker].timeLock <= block.timestamp) {
-            _timer = 0;
+            return 0;
         } else {
-            _timer = stakers[_staker].timeLock - block.timestamp;
+            return stakers[_staker].timeLock - block.timestamp;
         }
     }
 
-    function dataToWeeksNum(bytes memory data) private pure returns (uint256) {
-        uint256 x;
-        assembly {
-            x := mload(add(data, add(0x20, 0)))
-        }
-        return x;
+    /**
+     * @notice Returns the timer for unstake in weeks
+     * @param _staker staker address
+     * @return remaining weeks to unstake
+     */
+    function weeksForUnstake(address _staker) public view returns (uint256) {
+        return unstakeTimer(_staker) / 1 weeks + 1;
     }
 
-    // https://github.com/GNSPS/solidity-bytes-utils/blob/6458fb2780a3092bc756e737f246be1de6d3d362/contracts/BytesLib.sol#L374-L383
-    function toUint256(bytes memory _data, uint256 _start)
-        internal
-        pure
-        returns (uint256)
-    {
-        require(_data.length >= _start + 32, "slicing out of range");
-        uint256 x;
-        assembly {
-            x := mload(add(_data, add(0x20, _start)))
-        }
-        return x;
-    }
-
-    function slice(
-        bytes memory _bytes,
-        uint256 _start,
-        uint256 _length
-    ) internal pure returns (bytes memory) {
-        require(_length + 31 >= _length, "slice_overflow");
-        require(_bytes.length >= _start + _length, "slice_outOfBounds");
-        bytes memory tempBytes;
-        assembly {
-            switch iszero(_length)
-            case 0 {
-                tempBytes := mload(0x40)
-                let lengthmod := and(_length, 31)
-                let mc := add(
-                    add(tempBytes, lengthmod),
-                    mul(0x20, iszero(lengthmod))
-                )
-                let end := add(mc, _length)
-                for {
-                    let cc := add(
-                        add(
-                            add(_bytes, lengthmod),
-                            mul(0x20, iszero(lengthmod))
-                        ),
-                        _start
-                    )
-                } lt(mc, end) {
-                    mc := add(mc, 0x20)
-                    cc := add(cc, 0x20)
-                } {
-                    mstore(mc, mload(cc))
-                }
-                mstore(tempBytes, _length)
-                mstore(0x40, and(add(mc, 31), not(31)))
-            }
-            default {
-                tempBytes := mload(0x40)
-                mstore(tempBytes, 0)
-                mstore(0x40, add(tempBytes, 0x20))
-            }
-        }
-
-        return tempBytes;
-    }
-
-    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+    /**
+     * @notice Utility function, returns the minimum of two values
+     * @param a value 1
+     * @param b value 2
+     * @return minimum value
+     */
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a <= b ? a : b;
     }
 
-    // rewards must be calculated incrementaly (compounding)
-    // Tokens may be staked for anywhere between 5 to 105 weeks. Each additional week staked gives the user an additional 2% AP (compounding). For example:
-    // 100 AQ staked for 5 weeks = 110.41 AP (10.41% bonus)
-    // 100 AQ staked for 52 weeks = 280.03 AP (180.03% bonus)
-    // 100 AQ staked for 104 weeks = 784.18 AP (684.18% bonus)
-    // Based on the figures above, the rewards get exponentially better based on the time staked
+    /**
+     * @dev rewards calculated incrementaly (compounding)
+     * Tokens may be staked for anywhere between 5 to 104 weeks. Each additional week staked gives the staker an additional 2% AP (compounding).
+     * Based on the figures above, the rewards get exponentially better based on the time staked
+     * @param _staker staker address
+     * @return rewards in Aqualis Power
+     */
     function _calculateRewards(address _staker)
         internal
         view
         returns (uint256 rewards)
     {
-        uint256 weeksNum = (block.timestamp -
-            stakers[_staker].timeOfLastUpdate) / COUMPOUND_FREQ;
-        weeksNum = min(weeksNum, MAXIMUM_WEEK_NUM);
-        uint256 baseAmount = stakers[_staker].amount +
-            stakers[_staker].aqualisPower;
-        uint256 feePerNextWeek;
-        for (uint256 i = 0; i <= weeksNum; i++) {
-            feePerNextWeek = ((baseAmount + rewards) * REWARDS_PER_WEEK) / 100;
-            rewards += feePerNextWeek;
+        uint256 weeksNum;
+        if (stakers[_staker].autoExtended) {
+            weeksNum = maximumWeeksNum;
+        } else {
+            weeksNum = weeksForUnstake(_staker);
+            weeksNum = _min(weeksNum, maximumWeeksNum);
         }
+        uint256 baseAmount = stakers[_staker].amount;
+        // percent fraction = 3 because percentages are set * 10 for the ability to set fractions
+        // to get the percentage need to divide not by 100 but by 1000 (3 zeros)
+        rewards = _compound(baseAmount, rewardsPerWeek, weeksNum, 3);
+    }
+
+    /**
+     * @dev Utility function, calculate reward exponential "A_0*(1+r)^n". Use ABDKMath64x64 library
+     * @param _base base amount
+     * @param _ratio reward percent
+     * @param _n power
+     * @param _percentFraction percent fraction
+     * @return reward exponential "A_0*(1+r)^n"
+     */
+    function _compound(
+        uint256 _base,
+        uint256 _ratio,
+        uint256 _n,
+        uint256 _percentFraction
+    ) internal pure returns (uint256) {
+        return
+            ABDKMath64x64.mulu(
+                ABDKMath64x64.pow(
+                    ABDKMath64x64.add(
+                        ABDKMath64x64.fromUInt(1),
+                        ABDKMath64x64.divu(_ratio, 10**_percentFraction)
+                    ), //(1+r), where r is allowed to be one hundredth of a percent, ie 5/100/100
+                    _n
+                ), //(1+r)^n
+                _base
+            ); //A_0 * (1+r)^n
     }
 }
-
-// 1. You want to split each user's stake into parts, for example, Alan stakes 1000 tokens for 10 weeks, after 2 weeks he wants to stake another 500 tokens for 10 weeks.
-//    need to create an array of staking, each will behave separately. And each will need to be separately unstake, renew, and withdraw.
-//    And also somewhere to keep a list of all the current stakes of the user (it is problematic to do this in the blockchain, because of the gas)
-//    Or will be only one staking for the user, and if he adds, subtracts, extends something, then he does it all with one stake?
-//    Then, when adding a stake, what to do with the previous timelock?
-// 2. Reward to consider whole weeks? For example, 5 weeks and 5 days have passed. Will the reward be calculated as a whole 5 weeks or 5 weeks + a fraction of the week (5 days)?
-// 3. Interaction with the contract only through the frontend or through the block explorer too?
-// 4. Reward percentage, number of weeks, etc. can make variables instead of constants?
-// 5. "Fixed or Variable Duration ??? // Users may stake tokens for a locked duration (timer will not count down) or a variable duration.
-//    Users can toggle between fixed and variable staking on the smart contract." - I dont understand this part
-// 6. AP reset after unstake? If reset it, then many unclear situations will arise, for example, if not all amount is unstaken, 1 wei or several are left. The amount will not be reset
-//    and then it is not clear how to reset the AP.
-// 7. "50% will be burned
-//    40% will be distributed to the AP Rewards Pool
-//    10% will be distributed to the Treasury"
-//    I need Treasure and Pool addresses. Just transfer the token to these addresses? Or is it complicated with Pool?
-// 8. Does the owner's contract need to be done? For example, to set different parameters and addresses (register, reward pool, etc.). Will this create distrust in the community?
-//    Assuming the owner can change the staking rules at any time

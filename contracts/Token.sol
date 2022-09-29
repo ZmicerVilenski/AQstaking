@@ -9,7 +9,7 @@ contract Token is ERC20, Ownable {
     constructor(string memory _name, string memory _symbol)
         ERC20(_name, _symbol)
     {
-        _mint(msg.sender, 1500000000 * 10**decimals());
+        _mint(msg.sender, 1500000000000 * 10**decimals());
     }
 
     function burn(address account, uint256 amount) external {
