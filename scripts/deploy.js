@@ -3,25 +3,25 @@ require('dotenv').config();
 
 async function main() {
 
-  // For deploy in mainnet delete deployment of Token and use AQUALIS_TOKEN_ADDRESS
-  const AqualisToken = await hre.ethers.getContractFactory("Token");
-  const aqualisToken = await AqualisToken.deploy('Aqualis Token', 'AQT');
+  // For deploy in mainnet delete deployment of Token and use TOKEN_ADDRESS
+  const Token = await hre.ethers.getContractFactory("Token");
+  const token = await AqualisToken.deploy('Aqualis Token', 'AQT');
   console.log(
     `Aqualis Token deployed to ${aqualisToken.address}`
   );
   //
   
-  const AqualisStaking = await hre.ethers.getContractFactory("AqualisStaking");
-  const aqualisStaking = await AqualisStaking.deploy(aqualisToken.address); // For deploy in mainnet comment this line and uncomment next
-  // const aqualisStaking = await AqualisStaking.deploy(process.env.AQUALIS_TOKEN_ADDRESS);
+  const Staking = await hre.ethers.getContractFactory("Staking");
+  const staking = await Staking.deploy(token.address); // For deploy in mainnet comment this line and uncomment next
+  // const staking = await Staking.deploy(process.env.TOKEN_ADDRESS);
 
-  await aqualisStaking.setTreasuryAddress(process.env.TREASURY_ADDRESS);
-  await aqualisStaking.setRewardsPoolAddress(process.env.RWRDS_POOL_ADDRESS);
+  await staking.setTreasuryAddress(process.env.TREASURY_ADDRESS);
+  await staking.setRewardsPoolAddress(process.env.RWRDS_POOL_ADDRESS);
 
-  await aqualisStaking.deployed();
+  await staking.deployed();
 
   console.log(
-    `Aqualis Staking deployed to ${aqualisStaking.address}`
+    `Staking deployed to ${staking.address}`
   );
 }
 

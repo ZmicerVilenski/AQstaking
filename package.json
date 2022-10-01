@@ -1,7 +1,7 @@
 {
   "name": "stakingcontract",
   "version": "1.0.0",
-  "description": "Aqualis Staking Contract",
+  "description": "Staking Contract",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

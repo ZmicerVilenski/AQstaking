@@ -7,9 +7,9 @@ import "./Token.sol";
 import "./ABDKMath64x64.sol";
 
 /**
- * @title Aqualis staking contract
+ * @title Staking contract
  */
-contract AqualisStaking is Ownable, ReentrancyGuard {
+contract Staking is Ownable, ReentrancyGuard {
     uint256 public rewardsPerWeek; // 20 - 2% by default
     uint256 public penaltyPerWeek; // 3 by default that means 0.3% It will be necessary to divide percent powered by 10
     uint256 public minimumWeeksNum; // 5 by default
@@ -27,7 +27,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
         bool autoExtended;
     }
     mapping(address => StakeInfo) private stakers;
-    Token private immutable aqualisToken;
+    Token private immutable token;
 
     event Staked(
         address indexed staker,
@@ -50,10 +50,10 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
 
     /**
      * @dev Constructor function
-     * @param _aqualisToken ERC20 The address of the token contract used for staking
+     * @param _token ERC20 The address of the token contract used for staking
      */
-    constructor(address _aqualisToken) {
-        aqualisToken = Token(_aqualisToken);
+    constructor(address _token) {
+        token = Token(_token);
         // set default values:
         rewardsPerWeek = 20;
         penaltyPerWeek = 3;
@@ -123,16 +123,16 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Return deposit info (value array [stakeAmount, aqualisPower])
+     * @notice Return deposit info (value array [stakeAmount, rewardPower])
      * @param _staker Staker address
      */
     function getDepositInfo(address _staker)
         external
         view
-        returns (uint256 stakeAmount, uint256 aqualisPower)
+        returns (uint256 stakeAmount, uint256 rewardPower)
     {
         stakeAmount = stakers[_staker].amount;
-        aqualisPower = _calculateRewards(_staker);
+        rewardPower = _calculateRewards(_staker);
     }
 
     /**
@@ -193,7 +193,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
         stakers[_staker].amount += _amount;
         stakers[_staker].timeLock = block.timestamp + (_weeksNum * 1 weeks);
 
-        aqualisToken.transferFrom(_staker, address(this), _amount);
+        token.transferFrom(_staker, address(this), _amount);
         emit Staked(
             _staker,
             _amount,
@@ -301,7 +301,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
         );
         stakers[staker].amount -= _amount;
 
-        aqualisToken.transfer(staker, _amount);
+        token.transfer(staker, _amount);
         emit Unstaked(
             staker,
             _amount,
@@ -326,7 +326,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
         stakers[staker].amount = 0;
         stakers[staker].timeLock = 0;
 
-        aqualisToken.transfer(staker, amount);
+        token.transfer(staker, amount);
         emit Unstaked(staker, amount, totalStakedFor(staker), 0);
     }
 
@@ -349,22 +349,19 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
 
         stakers[staker].amount -= _amount;
 
-        aqualisToken.transfer(staker, returnAmount);
+        token.transfer(staker, returnAmount);
         // 50% will be burned
         uint256 toBurn = penalty / 2;
-        //aqualisToken.burn(address(this), toBurn);
-        aqualisToken.transfer(
+        //token.burn(address(this), toBurn);
+        token.transfer(
             address(0x000000000000000000000000000000000000dEaD),
             toBurn
         ); // To burn contract send tokens to DEAD address
         // 10% will be distributed to the Treasury
         uint256 toTreasury = penalty / 10;
-        aqualisToken.transfer(treasuryAddress, toTreasury);
+        token.transfer(treasuryAddress, toTreasury);
         // 40% will be distributed to the AP Rewards Pool
-        aqualisToken.transfer(
-            rewardsPoolAddress,
-            penalty - toBurn - toTreasury
-        );
+        token.transfer(rewardsPoolAddress, penalty - toBurn - toTreasury);
 
         emit Unstaked(
             staker,
@@ -388,23 +385,23 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
      * @return uint256 The number of tokens staked in the contract
      */
     function totalStaked() external view returns (uint256) {
-        return aqualisToken.balanceOf(address(this));
+        return token.balanceOf(address(this));
     }
 
     /**
      * @notice Address of the token being used by the staking interface
      * @return address The address of the ERC20 token used for staking
      */
-    function token() external view returns (address) {
-        return address(aqualisToken);
+    function tokenAddress() external view returns (address) {
+        return address(token);
     }
 
     /**
      * @notice returns reward in AP
      * @param _staker staker address
-     * @return rewards in Aqualis Power
+     * @return rewards in Reward Power
      */
-    function calculateAqualisPower(address _staker)
+    function calculateRewardPower(address _staker)
         external
         view
         returns (uint256)
@@ -415,7 +412,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
     /**
      * @notice Function for Snapshot
      * @param _staker staker address
-     * @return rewards in Aqualis Power
+     * @return rewards in Reward Power
      */
     function calculateReward(address _staker) external view returns (uint256) {
         return _calculateRewards(_staker);
@@ -466,7 +463,7 @@ contract AqualisStaking is Ownable, ReentrancyGuard {
      * Tokens may be staked for anywhere between 5 to 104 weeks. Each additional week staked gives the staker an additional 2% AP (compounding).
      * Based on the figures above, the rewards get exponentially better based on the time staked
      * @param _staker staker address
-     * @return rewards in Aqualis Power
+     * @return rewards in Reward Power
      */
     function _calculateRewards(address _staker)
         internal
